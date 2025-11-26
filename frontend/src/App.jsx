@@ -1,11 +1,21 @@
+// src/App.jsx
 import { useEffect, useState } from "react";
+
+import {
+  getCurrentUser,
+  fetchAuthSession,
+  fetchUserAttributes,
+  signInWithRedirect,
+  signOut,
+} from "aws-amplify/auth";
+
 import {
   fetchPosts,
   fetchMyPosts,
   createPost,
   fetchHotPosts,
 } from "./api";
-import { login, register } from "./authApi";
+
 import PostList from "./components/PostList";
 import NewPostForm from "./components/NewPostForm";
 
@@ -21,44 +31,109 @@ function App() {
   // Collapsible flags
   const [showAllPosts, setShowAllPosts] = useState(true);
   const [showMyPosts, setShowMyPosts] = useState(true);
-
-  // NEW: collapses inside "All posts"
   const [showAllMyInAll, setShowAllMyInAll] = useState(true);
   const [showAllOthersInAll, setShowAllOthersInAll] = useState(true);
 
-  // Auth state
-  const [currentUser, setCurrentUser] = useState(null); // { id, username }
-  const [token, setToken] = useState(null);
+  // Auth state (Cognito SSO only)
+  const [currentUser, setCurrentUser] = useState(null); // { username, email }
+  const [token, setToken] = useState(null);             // ID token we send to backend
+  const [authInitialized, setAuthInitialized] = useState(false);
 
-  const [authMode, setAuthMode] = useState("login"); // 'login' | 'register'
-  const [authUsername, setAuthUsername] = useState("");
-  const [authPassword, setAuthPassword] = useState("");
-  const [authError, setAuthError] = useState("");
-
-  // Load all posts on first render
+  // Initial load: posts + auth session
   useEffect(() => {
     loadAllPosts();
     loadHotPosts();
+    initAuthFromCognito();
   }, []);
 
   async function loadAllPosts() {
-    const data = await fetchPosts();
-    setAllPosts(data);
+    try {
+      const data = await fetchPosts();
+      setAllPosts(Array.isArray(data) ? data : []);
+    } catch (err) {
+      console.warn("[API] Failed to load all posts:", err);
+      setAllPosts([]);
+    }
   }
-
-  async function loadMyPosts() {
-    if (!token) return;
-    const data = await fetchMyPosts(token);
-    setMyPosts(data);
-  }
-
-  async function loadHotPosts() {
-    const data = await fetchHotPosts(5); // top 5
-    setHotPosts(data);
-  }
-
   
 
+  async function loadMyPosts(optionalToken) {
+    const t = optionalToken ?? token;
+    if (!t) {
+      setMyPosts([]);
+      return;
+    }
+  
+    try {
+      const data = await fetchMyPosts(t);
+      setMyPosts(Array.isArray(data) ? data : []);
+    } catch (err) {
+      console.warn("[API] Failed to load my posts:", err);
+      setMyPosts([]);
+    }
+  }
+  
+  async function loadHotPosts() {
+    try {
+      const data = await fetchHotPosts(5); // top 5
+      setHotPosts(Array.isArray(data) ? data : []);
+    } catch (err) {
+      console.warn("[API] Failed to load hot posts:", err);
+      setHotPosts([]);
+    }
+  }
+  // 🔐 Sync auth state from Cognito (called on mount and when needed)
+  async function initAuthFromCognito() {
+    try {
+      const { tokens } = await fetchAuthSession();
+      const idToken = tokens?.idToken;
+  
+      // Pull email + username from the ID token payload
+      const email = idToken?.payload?.email || null;
+      const tokenUsername =
+        idToken?.payload?.["cognito:username"] ||
+        idToken?.payload?.sub ||
+        null;
+  
+      if (idToken) {
+        const idTokenString = idToken.toString();
+  
+        setToken(idTokenString);
+        setCurrentUser({
+          // 👈 displayName: prefer email, else the Cognito username/sub
+          username: email || tokenUsername || "User",
+          email: email || "",
+        });
+  
+        try {
+          await loadMyPosts(idTokenString);
+        } catch (e) {
+          console.warn("[Auth] loadMyPosts failed after login:", e);
+          setMyPosts([]);
+        }
+      } else {
+        setCurrentUser(null);
+        setToken(null);
+        setMyPosts([]);
+      }
+  
+      if (window.location.pathname === "/callback") {
+        window.history.replaceState({}, "", "/");
+      }
+    } catch (err) {
+      console.warn("[Auth] Not logged in or session fetch failed:", err?.message);
+      setCurrentUser(null);
+      setToken(null);
+      setMyPosts([]);
+  
+      if (window.location.pathname === "/callback") {
+        window.history.replaceState({}, "", "/");
+      }
+    } finally {
+      setAuthInitialized(true);
+    }
+  }
+  
   async function handleCreatePost(postData) {
     const authorName = currentUser ? currentUser.username : "Guest";
 
@@ -71,48 +146,50 @@ function App() {
       token
     );
 
-    // Refresh both lists so everything stays in sync
     await loadAllPosts();
     if (currentUser) {
       await loadMyPosts();
     }
   }
 
-  async function handleAuthSubmit(e) {
-    e.preventDefault();
-    setAuthError("");
+  // 🟦 SSO Login: redirect to Cognito Hosted UI (only if not already signed in)
+  async function handleLogin() {
+    console.log("[SSO] Login button clicked");
+    // First, check if there is already a session
+    try {
+      const session = await fetchAuthSession();
+      const idToken = session.tokens?.idToken?.toString();
 
-    if (!authUsername || !authPassword) {
-      setAuthError("Username and password required");
-      return;
+      if (idToken) {
+        console.log("[SSO] User already authenticated, refreshing local state");
+        await initAuthFromCognito();
+        return; // Don't call signInWithRedirect again
+      }
+    } catch {
+      // No session -> ok to start login
+      console.log("[SSO] No existing session, proceeding to redirect");
     }
 
     try {
-      const fn = authMode === "login" ? login : register;
-      const result = await fn(authUsername, authPassword);
-
-      if (result.error) {
-        setAuthError(result.error);
-        return;
-      }
-
-      setToken(result.token);
-      setCurrentUser(result.user);
-      setAuthUsername("");
-      setAuthPassword("");
-
-      // Load user’s posts now that we’re logged in
-      await loadMyPosts();
+      await signInWithRedirect({ provider: "COGNITO" });
+      console.log("[SSO] signInWithRedirect called");
     } catch (err) {
-      console.error(err);
-      setAuthError("Auth failed");
+      console.error("[SSO] Error during signInWithRedirect:", err);
+      alert("SSO error: " + (err?.message || "Check console"));
     }
   }
 
-  function handleLogout() {
-    setToken(null);
-    setCurrentUser(null);
-    setMyPosts([]);
+  // 🟥 SSO Logout
+  async function handleLogout() {
+    try {
+      await signOut();
+    } catch (err) {
+      console.error("[SSO] Error during signOut:", err);
+    } finally {
+      setToken(null);
+      setCurrentUser(null);
+      setMyPosts([]);
+    }
   }
 
   return (
@@ -159,7 +236,9 @@ function App() {
               minWidth: 220,
             }}
           >
-            {currentUser ? (
+            {!authInitialized ? (
+              <div style={{ fontSize: 14 }}>Checking sign-in status...</div>
+            ) : currentUser ? (
               <div>
                 <div style={{ marginBottom: 4, fontSize: 14 }}>
                   Logged in as <strong>{currentUser.username}</strong>
@@ -178,122 +257,71 @@ function App() {
               </div>
             ) : (
               <div>
-                <div style={{ marginBottom: 4 }}>
-                  <button
-                    type="button"
-                    onClick={() => setAuthMode("login")}
-                    disabled={authMode === "login"}
-                    style={{ fontSize: 12, marginRight: 4 }}
-                  >
-                    Login
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setAuthMode("register")}
-                    disabled={authMode === "register"}
-                    style={{ fontSize: 12 }}
-                  >
-                    Register
-                  </button>
+                <div style={{ marginBottom: 4, fontSize: 14 }}>
+                  You are browsing as <strong>Guest</strong>
                 </div>
-                <form onSubmit={handleAuthSubmit}>
-                  <input
-                    placeholder="Username"
-                    value={authUsername}
-                    onChange={(e) => setAuthUsername(e.target.value)}
-                    style={{
-                      marginBottom: 4,
-                      width: "100%",
-                      fontSize: 12,
-                      padding: 4,
-                    }}
-                  />
-                  <input
-                    type="password"
-                    placeholder="Password"
-                    value={authPassword}
-                    onChange={(e) => setAuthPassword(e.target.value)}
-                    style={{
-                      marginBottom: 4,
-                      width: "100%",
-                      fontSize: 12,
-                      padding: 4,
-                    }}
-                  />
-                  {authError && (
-                    <div
-                      style={{
-                        color: "red",
-                        fontSize: 12,
-                        marginBottom: 4,
-                      }}
-                    >
-                      {authError}
-                    </div>
-                  )}
-                  <button
-                    type="submit"
-                    style={{
-                      width: "100%",
-                      padding: "4px 0",
-                      fontSize: 12,
-                      cursor: "pointer",
-                    }}
-                  >
-                    {authMode === "login" ? "Login" : "Register"}
-                  </button>
-                </form>
+                <button
+                  type="button"
+                  onClick={handleLogin}
+                  style={{
+                    width: "100%",
+                    padding: "4px 0",
+                    fontSize: 12,
+                    cursor: "pointer",
+                  }}
+                >
+                  Login / Sign up with SSO
+                </button>
               </div>
             )}
           </div>
         </header>
 
         {/* 🔥 Hot Topics section (most commented posts) */}
-<section style={{ marginBottom: 24 }}>
-  <div
-    style={{
-      display: "flex",
-      justifyContent: "space-between",
-      alignItems: "center",
-      cursor: "pointer",
-    }}
-    onClick={() => setShowHot((prev) => !prev)}
-  >
-    <h2 style={{ margin: 0, fontSize: 18 }}>Hot Topics</h2>
-    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-      <button
-        type="button"
-        onClick={(e) => {
-          e.stopPropagation();
-          loadHotPosts();
-        }}
-        style={{ fontSize: 12, padding: "2px 8px", cursor: "pointer" }}
-      >
-        Refresh
-      </button>
-      <span style={{ fontSize: 14, color: "#6b7280" }}>
-        {showHot ? "▼ Hide" : "▶ Show"}
-      </span>
-    </div>
-  </div>
+        <section style={{ marginBottom: 24 }}>
+          <div
+            style={{
+              display: "flex",
+              justifyContent: "space-between",
+              alignItems: "center",
+              cursor: "pointer",
+            }}
+            onClick={() => setShowHot((prev) => !prev)}
+          >
+            <h2 style={{ margin: 0, fontSize: 18 }}>Hot Topics</h2>
+            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  loadHotPosts();
+                }}
+                style={{ fontSize: 12, padding: "2px 8px", cursor: "pointer" }}
+              >
+                Refresh
+              </button>
+              <span style={{ fontSize: 14, color: "#6b7280" }}>
+                {showHot ? "▼ Hide" : "▶ Show"}
+              </span>
+            </div>
+          </div>
 
-  {showHot && (
-    <div style={{ marginTop: 8 }}>
-      {hotPosts.length === 0 ? (
-        <div style={{ fontSize: 14, color: "#6b7280" }}>
-          No hot topics yet. Start a conversation!
-        </div>
-      ) : (
-        <PostList
-          posts={hotPosts}
-          currentUserName={currentUser ? currentUser.username : "Guest"}
-          token={token}
-        />
-      )}
-    </div>
-  )}
-</section>
-
+          {showHot && (
+            <div style={{ marginTop: 8 }}>
+              {hotPosts.length === 0 ? (
+                <div style={{ fontSize: 14, color: "#6b7280" }}>
+                  No hot topics yet. Start a conversation!
+                </div>
+              ) : (
+                <PostList
+                  posts={hotPosts}
+                  currentUserName={currentUser ? currentUser.username : "Guest"}
+                  token={token}
+                />
+              )}
+            </div>
+          )}
+        </section>
 
         {/* New post form */}
         <section style={{ marginBottom: 24 }}>
@@ -301,125 +329,125 @@ function App() {
         </section>
 
         {/* All posts section (collapsible) */}
-       {/* All posts section (collapsible) */}
-<section
-  style={{
-    marginBottom: 16,
-    borderTop: "1px solid #e5e7eb",
-    paddingTop: 12,
-  }}
->
-  <div
-    style={{
-      display: "flex",
-      justifyContent: "space-between",
-      alignItems: "center",
-      cursor: "pointer",
-    }}
-    onClick={() => setShowAllPosts((prev) => !prev)}
-  >
-    <h2 style={{ margin: 0, fontSize: 18 }}>All posts</h2>
-    <span style={{ fontSize: 14, color: "#6b7280" }}>
-      {showAllPosts ? "▼ Hide" : "▶ Show"}
-    </span>
-  </div>
-
-  {showAllPosts && (
-    <div style={{ marginTop: 8 }}>
-      {/* If not logged in, just show everything as before */}
-      {!currentUser && (
-        <PostList
-          posts={allPosts}
-          currentUserName="Guest"
-          token={token}
-        />
-      )}
-
-      {/* If logged in, split All posts into "My posts" and "Other posts" */}
-      {currentUser && (
-        <>
-          {/* My posts inside All */}
+        <section
+          style={{
+            marginBottom: 16,
+            borderTop: "1px solid #e5e7eb",
+            paddingTop: 12,
+          }}
+        >
           <div
             style={{
-              marginBottom: 8,
-              padding: 8,
-              borderRadius: 6,
-              background: "#f9fafb",
-              border: "1px solid #e5e7eb",
+              display: "flex",
+              justifyContent: "space-between",
+              alignItems: "center",
+              cursor: "pointer",
             }}
+            onClick={() => setShowAllPosts((prev) => !prev)}
           >
-            <div
-              style={{
-                display: "flex",
-                justifyContent: "space-between",
-                alignItems: "center",
-                cursor: "pointer",
-              }}
-              onClick={() => setShowAllMyInAll((prev) => !prev)}
-            >
-              <h3 style={{ margin: 0, fontSize: 16 }}>My posts (in feed)</h3>
-              <span style={{ fontSize: 13, color: "#6b7280" }}>
-                {showAllMyInAll ? "▼ Hide" : "▶ Show"}
-              </span>
-            </div>
-
-            {showAllMyInAll && (
-              <div style={{ marginTop: 6 }}>
-                <PostList
-                  posts={allPosts.filter(
-                    (p) => p.authorName === currentUser.username
-                  )}
-                  currentUserName={currentUser.username}
-                  token={token}
-                />
-              </div>
-            )}
+            <h2 style={{ margin: 0, fontSize: 18 }}>All posts</h2>
+            <span style={{ fontSize: 14, color: "#6b7280" }}>
+              {showAllPosts ? "▼ Hide" : "▶ Show"}
+            </span>
           </div>
 
-          {/* Other users' posts inside All */}
-          <div
-            style={{
-              padding: 8,
-              borderRadius: 6,
-              background: "#f9fafb",
-              border: "1px solid #e5e7eb",
-            }}
-          >
-            <div
-              style={{
-                display: "flex",
-                justifyContent: "space-between",
-                alignItems: "center",
-                cursor: "pointer",
-              }}
-              onClick={() => setShowAllOthersInAll((prev) => !prev)}
-            >
-              <h3 style={{ margin: 0, fontSize: 16 }}>
-                Other people&apos;s posts
-              </h3>
-              <span style={{ fontSize: 13, color: "#6b7280" }}>
-                {showAllOthersInAll ? "▼ Hide" : "▶ Show"}
-              </span>
-            </div>
-
-            {showAllOthersInAll && (
-              <div style={{ marginTop: 6 }}>
+          {showAllPosts && (
+            <div style={{ marginTop: 8 }}>
+              {/* Guest → see everything */}
+              {!currentUser && (
                 <PostList
-                  posts={allPosts.filter(
-                    (p) => p.authorName !== currentUser.username
-                  )}
-                  currentUserName={currentUser.username}
+                  posts={allPosts}
+                  currentUserName="Guest"
                   token={token}
                 />
-              </div>
-            )}
-          </div>
-        </>
-      )}
-    </div>
-  )}
-</section>
+              )}
 
+              {/* Logged in → split "All" into My posts + Others */}
+              {currentUser && (
+                <>
+                  {/* My posts inside All */}
+                  <div
+                    style={{
+                      marginBottom: 8,
+                      padding: 8,
+                      borderRadius: 6,
+                      background: "#f9fafb",
+                      border: "1px solid #e5e7eb",
+                    }}
+                  >
+                    <div
+                      style={{
+                        display: "flex",
+                        justifyContent: "space-between",
+                        alignItems: "center",
+                        cursor: "pointer",
+                      }}
+                      onClick={() => setShowAllMyInAll((prev) => !prev)}
+                    >
+                      <h3 style={{ margin: 0, fontSize: 16 }}>
+                        My posts (in feed)
+                      </h3>
+                      <span style={{ fontSize: 13, color: "#6b7280" }}>
+                        {showAllMyInAll ? "▼ Hide" : "▶ Show"}
+                      </span>
+                    </div>
+
+                    {showAllMyInAll && (
+                      <div style={{ marginTop: 6 }}>
+                        <PostList
+                          posts={allPosts.filter(
+                            (p) => p.authorName === currentUser.username
+                          )}
+                          currentUserName={currentUser.username}
+                          token={token}
+                        />
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Other users' posts inside All */}
+                  <div
+                    style={{
+                      padding: 8,
+                      borderRadius: 6,
+                      background: "#f9fafb",
+                      border: "1px solid #e5e7eb",
+                    }}
+                  >
+                    <div
+                      style={{
+                        display: "flex",
+                        justifyContent: "space-between",
+                        alignItems: "center",
+                        cursor: "pointer",
+                      }}
+                      onClick={() => setShowAllOthersInAll((prev) => !prev)}
+                    >
+                      <h3 style={{ margin: 0, fontSize: 16 }}>
+                        Other people&apos;s posts
+                      </h3>
+                      <span style={{ fontSize: 13, color: "#6b7280" }}>
+                        {showAllOthersInAll ? "▼ Hide" : "▶ Show"}
+                      </span>
+                    </div>
+
+                    {showAllOthersInAll && (
+                      <div style={{ marginTop: 6 }}>
+                        <PostList
+                          posts={allPosts.filter(
+                            (p) => p.authorName !== currentUser.username
+                          )}
+                          currentUserName={currentUser.username}
+                          token={token}
+                        />
+                      </div>
+                    )}
+                  </div>
+                </>
+              )}
+            </div>
+          )}
+        </section>
 
         {/* My posts section (only when logged in) */}
         {currentUser && (
@@ -447,7 +475,11 @@ function App() {
                     e.stopPropagation();
                     loadMyPosts();
                   }}
-                  style={{ fontSize: 12, padding: "2px 8px", cursor: "pointer" }}
+                  style={{
+                    fontSize: 12,
+                    padding: "2px 8px",
+                    cursor: "pointer",
+                  }}
                 >
                   Refresh
                 </button>
